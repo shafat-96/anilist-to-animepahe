@@ -34,9 +34,9 @@ npm run dev
 GET /api/search?query=<search_term>
 ```
 
-### Get Anime Details
+### Get Anime episodes
 ```
-GET /api/anime/:aniListId/:animePaheId
+GET /api/:aniListId
 ```
 
 ### Get Episode Sources
