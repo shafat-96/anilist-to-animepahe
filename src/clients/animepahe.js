@@ -1,22 +1,78 @@
 import fetch from 'node-fetch';
 import { parse } from 'node-html-parser';
 
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
+
 class AnimePaheClient {
     constructor() {
         this.baseUrl = 'https://animepahe.ru';
-        this.headers = {
-            'Cookie': '__ddg1_=;__ddg2_=;',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
+    getHeaders(sessionId = false) {
+        return {
+            'authority': 'animepahe.ru',
+            'accept': 'application/json, text/javascript, */*; q=0.01',
+            'accept-language': 'en-US,en;q=0.9',
+            'cookie': '__ddg2_=;',
+            'dnt': '1',
+            'sec-ch-ua': '"Not A(Brand";v="99", "Microsoft Edge";v="121", "Chromium";v="121"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'x-requested-with': 'XMLHttpRequest',
+            'referer': sessionId ? `${this.baseUrl}/anime/${sessionId}` : this.baseUrl,
+            'user-agent': USER_AGENT
         };
+    }
+
+    async _makeRequest(url, options = {}) {
+        const defaultOptions = {
+            headers: this.getHeaders(options.sessionId),
+            redirect: 'follow',
+            follow: 20,
+            timeout: 10000
+        };
+
+        const finalOptions = {
+            ...defaultOptions,
+            ...options,
+            headers: {
+                ...defaultOptions.headers,
+                ...options.headers
+            }
+        };
+
+        let response = await fetch(url, finalOptions);
+        
+        if (response.status === 403) {
+            // Try with a different user agent
+            finalOptions.headers['user-agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
+            response = await fetch(url, finalOptions);
+        }
+
+        if (!response.ok) {
+            throw new Error(`Request failed with status ${response.status}`);
+        }
+
+        return response;
     }
 
     async searchAnime(query) {
         try {
-            const response = await fetch(`${this.baseUrl}/api?m=search&l=8&q=${encodeURIComponent(query)}`, {
-                headers: this.headers
+            const response = await this._makeRequest(`${this.baseUrl}/api?m=search&l=8&q=${encodeURIComponent(query)}`, {
+                headers: {
+                    'Accept': 'application/json'
+                }
             });
+
             const data = await response.json();
             
+            if (!data.data || !Array.isArray(data.data)) {
+                return [];
+            }
+
             return data.data.map(item => ({
                 name: item.title,
                 poster: item.poster,
@@ -24,11 +80,14 @@ class AnimePaheClient {
                 episodes: {
                     sub: item.episodes,
                     dub: '??'
-                }
+                },
+                rating: item.score,
+                releaseDate: item.year,
+                type: item.type
             }));
         } catch (error) {
             console.error('AnimePahe search error:', error);
-            throw error;
+            return [];
         }
     }
 
@@ -44,21 +103,36 @@ class AnimePaheClient {
     }
 
     async _getSession(title, animeId) {
-        const response = await fetch(`${this.baseUrl}/api?m=search&q=${encodeURIComponent(title)}`, {
-            headers: this.headers
+        const response = await this._makeRequest(`${this.baseUrl}/api?m=search&q=${encodeURIComponent(title)}`, {
+            headers: {
+                'Accept': 'application/json'
+            }
         });
         const data = await response.json();
+        
+        if (!data.data || !Array.isArray(data.data)) {
+            throw new Error('Invalid search response');
+        }
+
         const session = data.data.find(
             anime => anime.title === title
         ) || data.data[0];
+
+        if (!session) {
+            throw new Error('No matching anime found');
+        }
 
         return session.session;
     }
 
     async _fetchAllEpisodes(session, page = 1, allEpisodes = []) {
-        const response = await fetch(
+        const response = await this._makeRequest(
             `${this.baseUrl}/api?m=release&id=${session}&sort=episode_desc&page=${page}`,
-            { headers: this.headers }
+            {
+                headers: {
+                    'Accept': 'application/json'
+                }
+            }
         );
         const data = await response.json();
 
@@ -76,13 +150,13 @@ class AnimePaheClient {
         }
 
         // Fetch anime title
-        const animeResponse = await fetch(
-            `${this.baseUrl}/a/${data.data[0].anime_id}`,
-            { headers: this.headers }
+        const animeResponse = await this._makeRequest(
+            `${this.baseUrl}/a/${data.data[0].anime_id}`
         );
         const html = await animeResponse.text();
-        const titleMatch = html.match(/<span class="title-wrapper">([^<]+)<\/span>/);
-        const animeTitle = titleMatch ? titleMatch[1].trim() : 'Could not fetch title';
+        const root = parse(html);
+        const titleElement = root.querySelector('.title-wrapper span');
+        const animeTitle = titleElement ? titleElement.text.trim() : 'Could not fetch title';
 
         return {
             title: animeTitle,
@@ -94,14 +168,9 @@ class AnimePaheClient {
 
     async getEpisodeSources(episodeUrl) {
         try {
-            const [session, episodeSession] = episodeUrl.split('/');
-            const response = await fetch(`${this.baseUrl}/play/${session}/${episodeSession}`, {
-                headers: this.headers
+            const response = await this._makeRequest(`${this.baseUrl}/play/${episodeUrl}`, {
+                sessionId: episodeUrl.split('/')[0]
             });
-            
-            if (!response.ok) {
-                throw new Error(`Failed to fetch episode: ${response.status}`);
-            }
 
             const html = await response.text();
             const root = parse(html);
@@ -111,6 +180,7 @@ class AnimePaheClient {
             for (const button of buttons) {
                 const quality = button.text.trim();
                 const kwikLink = button.getAttribute('data-src');
+                const audio = button.getAttribute('data-audio');
                 
                 if (kwikLink) {
                     const videoResult = await this._extractKwikVideo(kwikLink);
@@ -118,16 +188,8 @@ class AnimePaheClient {
                         videoLinks.push({
                             quality: quality,
                             url: videoResult.url,
-                            referer: 'https://kwik.cx'
-                        });
-                    } else {
-                        // If extraction failed, include the original Kwik URL
-                        videoLinks.push({
-                            quality: quality,
-                            url: videoResult.originalUrl,
                             referer: 'https://kwik.cx',
-                            direct: false,
-                            message: videoResult.message
+                            isDub: audio === 'eng'
                         });
                     }
                 }
@@ -147,54 +209,63 @@ class AnimePaheClient {
                 return qualityA - qualityB;
             });
 
+            // Organize links by sub/dub
+            const organizedLinks = this._organizeStreamLinks(videoLinks);
+
             return {
-                sources: videoLinks.length > 0 ? [{ url: videoLinks[0].url, direct: videoLinks[0].direct !== false }] : [],
+                headers: {
+                    Referer: 'https://kwik.cx/'
+                },
+                sources: [
+                    {
+                        url: organizedLinks.sub[0] || organizedLinks.dub[0]
+                    }
+                ],
                 multiSrc: videoLinks
             };
         } catch (error) {
             console.error('Error getting episode sources:', error);
-            throw error;
+            return { sources: [], multiSrc: [] };
         }
+    }
+
+    _organizeStreamLinks(links) {
+        const result = { sub: [], dub: [] };
+        const qualityOrder = ['1080p', '720p', '360p'];
+
+        for (const link of links) {
+            const isDub = link.isDub;
+            const targetList = isDub ? result.dub : result.sub;
+            targetList.push(link.url);
+        }
+
+        // Sort by quality
+        const sortByQuality = (a, b) => {
+            const qualityA = qualityOrder.indexOf(a.match(/\d+p/)?.[0] || '');
+            const qualityB = qualityOrder.indexOf(b.match(/\d+p/)?.[0] || '');
+            return qualityB - qualityA;
+        };
+
+        result.sub.sort(sortByQuality);
+        result.dub.sort(sortByQuality);
+
+        return result;
     }
 
     async _extractKwikVideo(url) {
         try {
-            // First request to get the Kwik page
-            const response = await fetch(url, {
+            const response = await this._makeRequest(url, {
                 headers: {
-                    ...this.headers,
                     'Referer': this.baseUrl,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Upgrade-Insecure-Requests': '1',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'cross-site',
-                    'Connection': 'keep-alive'
+                    'Host': 'kwik.si',
+                    'Origin': 'https://kwik.si',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
                 }
             });
-            
-            if (response.status === 403) {
-                // Return a structured error response instead of throwing
-                return {
-                    error: true,
-                    message: 'Access denied by Kwik. Direct video extraction not available.',
-                    originalUrl: url
-                };
-            }
-
-            if (!response.ok) {
-                return {
-                    error: true,
-                    message: `Failed to fetch Kwik page: ${response.status}`,
-                    originalUrl: url
-                };
-            }
 
             const html = await response.text();
-            
-            // Extract and evaluate the obfuscated script using the correct regex
             const scriptMatch = /(eval)(\(f.*?)(\n<\/script>)/s.exec(html);
+            
             if (!scriptMatch) {
                 return {
                     error: true,
@@ -211,6 +282,7 @@ class AnimePaheClient {
                 return {
                     error: false,
                     url: m3u8Match[0],
+                    isM3U8: true,
                     originalUrl: url
                 };
             }
@@ -228,27 +300,6 @@ class AnimePaheClient {
                 originalUrl: url
             };
         }
-    }
-
-    _organizeStreamLinks(links) {
-        const result = { sub: [], dub: [] };
-        const qualityOrder = ['1080p', '720p', '480p', '360p'];
-
-        for (const link of links) {
-            const isDub = link.quality.toLowerCase().includes('eng');
-            const targetList = isDub ? result.dub : result.sub;
-            targetList.push(link.url);
-        }
-
-        for (const type of ['sub', 'dub']) {
-            result[type].sort((a, b) => {
-                const qualityA = qualityOrder.indexOf(a.match(/\d+p/)?.[0] || '');
-                const qualityB = qualityOrder.indexOf(b.match(/\d+p/)?.[0] || '');
-                return qualityA - qualityB;
-            });
-        }
-
-        return result;
     }
 }
 
