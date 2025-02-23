@@ -113,12 +113,23 @@ class AnimePaheClient {
                 const kwikLink = button.getAttribute('data-src');
                 
                 if (kwikLink) {
-                    const videoUrl = await this._extractKwikVideo(kwikLink);
-                    videoLinks.push({
-                        quality: quality,
-                        url: videoUrl,
-                        referer: 'https://kwik.cx'
-                    });
+                    const videoResult = await this._extractKwikVideo(kwikLink);
+                    if (!videoResult.error) {
+                        videoLinks.push({
+                            quality: quality,
+                            url: videoResult.url,
+                            referer: 'https://kwik.cx'
+                        });
+                    } else {
+                        // If extraction failed, include the original Kwik URL
+                        videoLinks.push({
+                            quality: quality,
+                            url: videoResult.originalUrl,
+                            referer: 'https://kwik.cx',
+                            direct: false,
+                            message: videoResult.message
+                        });
+                    }
                 }
             }
 
@@ -136,15 +147,9 @@ class AnimePaheClient {
                 return qualityA - qualityB;
             });
 
-            const sources = videoLinks.map(link => ({
-                url: link.url,
-                quality: link.quality,
-                referer: link.referer
-            }));
-
             return {
-                sources: sources.length > 0 ? [{ url: sources[0].url }] : [],
-                multiSrc: sources
+                sources: videoLinks.length > 0 ? [{ url: videoLinks[0].url, direct: videoLinks[0].direct !== false }] : [],
+                multiSrc: videoLinks
             };
         } catch (error) {
             console.error('Error getting episode sources:', error);
@@ -158,12 +163,32 @@ class AnimePaheClient {
             const response = await fetch(url, {
                 headers: {
                     ...this.headers,
-                    'Referer': this.baseUrl
+                    'Referer': this.baseUrl,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'cross-site',
+                    'Connection': 'keep-alive'
                 }
             });
             
+            if (response.status === 403) {
+                // Return a structured error response instead of throwing
+                return {
+                    error: true,
+                    message: 'Access denied by Kwik. Direct video extraction not available.',
+                    originalUrl: url
+                };
+            }
+
             if (!response.ok) {
-                throw new Error(`Failed to fetch Kwik page: ${response.status}`);
+                return {
+                    error: true,
+                    message: `Failed to fetch Kwik page: ${response.status}`,
+                    originalUrl: url
+                };
             }
 
             const html = await response.text();
@@ -171,7 +196,11 @@ class AnimePaheClient {
             // Extract and evaluate the obfuscated script using the correct regex
             const scriptMatch = /(eval)(\(f.*?)(\n<\/script>)/s.exec(html);
             if (!scriptMatch) {
-                throw new Error('Could not find obfuscated script');
+                return {
+                    error: true,
+                    message: 'Could not find obfuscated script',
+                    originalUrl: url
+                };
             }
 
             const evalCode = scriptMatch[2].replace('eval', '');
@@ -179,13 +208,25 @@ class AnimePaheClient {
             const m3u8Match = deobfuscated.match(/https.*?m3u8/);
             
             if (m3u8Match && m3u8Match[0]) {
-                return m3u8Match[0];
+                return {
+                    error: false,
+                    url: m3u8Match[0],
+                    originalUrl: url
+                };
             }
 
-            return url;
+            return {
+                error: true,
+                message: 'Could not extract m3u8 URL',
+                originalUrl: url
+            };
         } catch (error) {
             console.error('Error extracting Kwik video:', error);
-            return url;
+            return {
+                error: true,
+                message: error.message,
+                originalUrl: url
+            };
         }
     }
 
